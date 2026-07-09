@@ -1,6 +1,8 @@
 Open Vehicle Monitor System v3 - Change log
 
 ????-??-?? ???  ???????  OTA release
+- VW e-Golf: correct v.b.current / v.b.power sign to the OVMS output=positive convention
+    (discharge positive, charge negative).
 - smart EQ:
     As soon as the 12V trickle charge begins, a timestamp is generated and stored in `m_12v_trickle_charge_times`.
     The counted value is set in `xsq.12v.trickle.count`.
