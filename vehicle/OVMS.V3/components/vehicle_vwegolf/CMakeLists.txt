@@ -2,7 +2,7 @@ set(srcs)
 set(include_dirs)
 
 if (CONFIG_OVMS_VEHICLE_VWEGOLF)
-  list(APPEND srcs "src/vehicle_vwegolf.cpp")
+  list(APPEND srcs "src/vehicle_vwegolf.cpp" "src/bap/bap.cpp" "src/egolf/battery_control.cpp")
   list(APPEND include_dirs "src")
 endif ()
 
