@@ -42,6 +42,11 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
     // gear-selector frame 0x187 in IncomingFrameCan2. -1 until first seen in D/B.
     m_recup_level = MyMetrics.InitInt("xvg.v.recup", SM_STALE_MIN, -1);
 
+    // Zieltemperatur der Vorklimatisierung aus dem BAP-Profil. Nicht zu
+    // verwechseln mit v.e.cabinsetpoint -- das kommt aus Frame 0x594 und
+    // traegt denselben Wert in anderer Kodierung.
+    m_cc_temp = MyMetrics.InitFloat("xvg.v.cc.temp", SM_STALE_MIN, 0, Celcius);
+
     // KCAN (CAN3) carries comfort, body, and clima frames via the J533 gateway.
     // FCAN (CAN2) is the powertrain bus (BMS, motor controller, VIN).
     // CAN1 (OBD) is diagnostic-only and inaccessible while the car is asleep.
@@ -64,6 +69,8 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
     });
     cmd_vweg->RegisterCommand("fold_mirrors", "Fold mirrors in",
                               [this](...) { CommandMirrorFoldIn(); });
+    cmd_vweg->RegisterCommand("profile", "Read charge/climate profile from the car",
+                              [this](...) { QueueBapProfile(); });
 }
 
 OvmsVehicleVWeGolf::~OvmsVehicleVWeGolf() {
@@ -162,6 +169,77 @@ void OvmsVehicleVWeGolf::IncomingFrameCan2(CAN_frame_t* p_frame) {
 
 void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
     m_last_message_received = 0;
+
+    // BAP-Anwendungsschicht erkennen. Nach dem Wecken sendet der Bus zunaechst
+    // nur Statusframes; die 0x1733xxxx-Familie kommt erst rund 30 s spaeter.
+    // Erst dann nimmt die Klima-ECU Kommandos an.
+    if ((p_frame->MsgID & 0xFFFF0000UL) == 0x17330000UL) m_bap_ready = true;
+    // Kanal 0x25 = BatteryControl (Klima/Laden). Meldet sich die ECU selbst,
+    // ist sie ansprechbar und wir muessen die Einschwingzeit nicht abwarten.
+    if (p_frame->MsgID == 0x17332510UL) {
+        m_clima_bap_seen = true;
+
+        // BAP-Langnachricht zusammensetzen. Kopf: 80/90/a0 <len> <func> ...,
+        // Fortsetzungen c0/d0/e0 aufwaerts. Wir verfolgen nur den Strang, der
+        // die Profilliste traegt; die anderen laufen parallel und werden
+        // ignoriert.
+        const uint8_t* b = p_frame->data.u8;
+        uint8_t dlc = p_frame->FIR.B.DLC;
+        // Doppelte Zustellung abfangen: IncomingFrameCan2 reicht die vom J533
+        // gespiegelten Frames hier ebenfalls herein, jeder BAP-Frame kommt also
+        // zweimal an. Fuer die zustandslosen Dekoder ist das folgenlos, den
+        // Zusammensetzer der Langnachricht bringt es aus dem Tritt: Der zweite
+        // c0 passt nicht mehr zum erwarteten c1, der Strang bricht ab.
+        // Innerhalb einer Langnachricht zaehlt der Marker hoch -- zwei gleiche
+        // Frames hintereinander sind daher immer eine Wiederholung.
+        if (dlc == m_prof_prev_dlc && dlc <= 8
+            && memcmp(b, m_prof_prev, dlc) == 0) goto bap_done;
+        m_prof_prev_dlc = dlc;
+        for (uint8_t i = 0; i < dlc && i < 8; i++) m_prof_prev[i] = b[i];
+        if (dlc >= 4 && (b[0] == 0x80 || b[0] == 0x90 || b[0] == 0xA0)) {
+            uint16_t func = ((uint16_t)b[2] << 8) | b[3];
+            ESP_LOGI(TAG, "BAP head: %02x len=%u func=%04x", b[0], b[1], func);
+            if ((func & VWEGOLF_BAP_FUNC_MASK) == VWEGOLF_BAP_PROP_PROFILE
+                && b[1] <= VWEGOLF_PROF_MAXLEN) {
+                m_prof_len = b[1];
+                m_prof_pos = 0;
+                m_prof_active = true;
+                m_prof_gap = false;
+                // Fortsetzungsmarker gehoert zum selben Strang: 80->c0, 90->d0, a0->e0
+                m_prof_cont = (b[0] == 0x80) ? 0xC0 : ((b[0] == 0x90) ? 0xD0 : 0xE0);
+                for (uint8_t i = 4; i < dlc && m_prof_pos < m_prof_len; i++)
+                    m_prof_buf[m_prof_pos++] = b[i];
+                if (m_prof_pos >= m_prof_len) { m_prof_active = false; ParseBapProfile(); }
+            }
+        } else if (m_prof_active && dlc >= 2
+                   && (b[0] & 0xF0) == (m_prof_cont & 0xF0)) {
+            if (b[0] != m_prof_cont) {
+                // Frame verloren. Luecke stopfen, damit die folgenden Bytes an
+                // der richtigen Stelle landen, und das Profil als unbrauchbar
+                // fuer das Zurueckschreiben markieren.
+                int8_t skip = (int8_t)(b[0] - m_prof_cont);
+                if (skip < 1 || skip > 4) {
+                    ESP_LOGW(TAG, "BAP stream lost (want %02x got %02x), abort",
+                             m_prof_cont, b[0]);
+                    m_prof_active = false;
+                    m_prof_len = 0;
+                    goto bap_done;
+                }
+                ESP_LOGW(TAG, "BAP gap: %d frame(s) missing before %02x", skip, b[0]);
+                m_prof_gap = true;
+                for (int8_t s = 0; s < skip; s++)
+                    for (uint8_t k = 0; k < 7 && m_prof_pos < m_prof_len; k++)
+                        m_prof_buf[m_prof_pos++] = 0xFF;
+                m_prof_cont = b[0];
+            }
+            for (uint8_t i = 1; i < dlc && m_prof_pos < m_prof_len; i++)
+                m_prof_buf[m_prof_pos++] = b[i];
+            m_prof_cont++;
+            if (m_prof_pos >= m_prof_len) { m_prof_active = false; ParseBapProfile(); }
+        }
+        bap_done: ;
+    }
+
     uint8_t* d = p_frame->data.u8;
 
     uint8_t tmp_u8 = 0;
@@ -748,6 +826,37 @@ void OvmsVehicleVWeGolf::Ticker1(uint32_t ticker) {
         // Clima ECU (0x5EA) is silent once the bus sleeps, so it can't refresh HVAC;
         // clear it so climate doesn't read "on" forever after conditioning ends.
         StandardMetrics.ms_v_env_hvac->SetValue(false);
+        // Mit dem Bus schlaeft auch die BAP-Schicht ein.
+        m_bap_ready = false;
+        m_clima_bap_seen = false;
+        m_online_secs = 0;
+    } else if (m_online_secs < 255) {
+        m_online_secs++;
+    }
+
+    // Netzwerkmanagement zyklisch senden, solange wir die Steuerung halten.
+    // Das weckt einen schlafenden Bus und haelt ihn wach -- hoert man auf,
+    // schlaeft das Fahrzeug binnen Sekunden wieder ein. Bewusst auch dann, wenn
+    // der Bus noch still ist: genau das ist der Weckvorgang.
+    if (m_is_control_active) {
+        if (m_nm_backoff > 0) {
+            // Voriger Frame haengt noch in der Warteschlange -- aussetzen. Der
+            // Controller wiederholt ihn ohnehin selbst, und genau diese
+            // Busaktivitaet weckt die schlafenden Steuergeraete.
+            m_nm_backoff--;
+        } else if (!SendNetworkManagement()) {
+            m_nm_backoff = 3;
+            if (m_nm_stalled < 255) m_nm_stalled++;
+            if (m_nm_stalled == 8)
+                ESP_LOGW(TAG,
+                         "Network management stalled: bus is not acknowledging. "
+                         "Vehicle may be unreachable until it wakes on its own.");
+        } else {
+            m_nm_stalled = 0;
+        }
+    } else {
+        m_nm_backoff = 0;
+        m_nm_stalled = 0;
     }
 
     if (m_is_control_active &&
@@ -828,10 +937,13 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandClimateControl(bool en
     // Climate needs the car awake — this deliberately uses the OCU wake/heartbeat
     // path. If the bus is asleep, wake it; the queued command goes out on the next
     // heartbeat tick after the car comes online.
-    if (!m_is_car_online)
+    bool was_asleep = !m_is_car_online;
+    if (was_asleep)
         CommandWakeup();
     m_is_control_active = true;
-    m_control_hold = VWEGOLF_OCU_HOLD_SECS;  // held (re-armed by Ticker1) until the command is delivered
+    // Aus dem Tiefschlaf braucht die BAP-Schicht rund 30 s. Mit den 15 s des
+    // Normalfalls lief das Fenster ab, bevor der Befehl abgesetzt werden konnte.
+    m_control_hold = was_asleep ? VWEGOLF_OCU_WAKE_SECS : VWEGOLF_OCU_HOLD_SECS;
     return Success;
 }
 
@@ -881,15 +993,10 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandWakeup() {
 
         vTaskDelay(pdMS_TO_TICKS(100));
         length = 8;
-        data[0] = 0x67;  // source node identifier identity of the transmitter of the message
-        data[1] = 0x10;  // could be anything
-        data[2] = 0x41;  // 0-5 => State,  6 => eCall Car Wakeup
-        data[3] = 0x84;  // 0-8 => eCall Wakeup
-        data[4] = 0x14;
-        data[5] = 0x00;
-        data[6] = 0x00;
-        data[7] = 0x00;
-        comfBus->WriteExtended(0x1B000067, length, data);
+        // NM-Anmeldung mit der am Fahrzeug verifizierten Maske. Die frueheren
+        // Nutzdaten (67 10 41 84 14 00 00 00) entsprachen nicht dem NM-Schema
+        // dieses Busses; damit blieb die BAP-Schicht unten.
+        SendNetworkManagement();
         vTaskDelay(pdMS_TO_TICKS(50));
         ESP_LOGV(TAG, "second message send ID: data 0->7");
         ESP_LOGV(TAG,
@@ -902,6 +1009,147 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandWakeup() {
         ESP_LOGI(TAG, "Wakeup not necessary car was online before");
     }
     return Success;
+}
+
+// Merkt die Profilabfrage vor. Gesendet wird sie erst, wenn der Bus wach und
+// eingeschwungen ist -- ueber denselben Weg wie der Klimabefehl. Direkt auf einen
+// schlafenden Bus zu senden verstopft die Sendewarteschlange dauerhaft.
+void OvmsVehicleVWeGolf::QueueBapProfile() {
+    m_profile_requested = true;
+    m_prof_retries = 8;
+    m_prof_wait = 0;
+    m_prof_valid = false;
+    bool was_asleep = !m_is_car_online;
+    if (was_asleep) {
+        ESP_LOGI(TAG, "Profile request queued, waking the car first");
+        CommandWakeup();
+    }
+    m_is_control_active = true;
+    m_control_hold = was_asleep ? VWEGOLF_OCU_WAKE_SECS : VWEGOLF_OCU_HOLD_SECS;
+}
+
+// Fordert die Profilliste an. Erst den Kanal oeffnen (die beiden Get-Anfragen
+// auf die Standardeigenschaften, wie es auch das Werksgeraet tut), dann die
+// Profilliste selbst. Antworten laufen ueber IncomingFrameCan3 auf.
+void OvmsVehicleVWeGolf::RequestBapProfile() {
+    canbus* comfBus = m_can3;
+    if (comfBus->GetPowerMode() != On) {
+        comfBus->SetPowerMode(On);
+        comfBus->Start(CAN_MODE_ACTIVE, CAN_SPEED_500KBPS);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    uint8_t data[2];
+    data[0] = 0x19; data[1] = 0x42;
+    comfBus->WriteExtended(VWEGOLF_BAP_REQ_ID, 2, data);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    data[0] = 0x19; data[1] = 0x41;
+    comfBus->WriteExtended(VWEGOLF_BAP_REQ_ID, 2, data);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    data[0] = 0x19; data[1] = 0x59;
+    comfBus->WriteExtended(VWEGOLF_BAP_REQ_ID, 2, data);
+    ESP_LOGI(TAG, "BAP profile requested (19 59)");
+}
+
+// Wertet den zusammengesetzten Profilpuffer aus.
+void OvmsVehicleVWeGolf::ParseBapProfile() {
+    // Hexdump in Zeilen zu 16 Byte. Vorlage fuer das spaetere Zurueckschreiben.
+    char line[64];
+    for (uint16_t o = 0; o < m_prof_len; o += 16) {
+        int n = 0;
+        for (uint16_t i = o; i < o + 16 && i < m_prof_len; i++)
+            n += snprintf(line + n, sizeof(line) - n, "%02x ", m_prof_buf[i]);
+        ESP_LOGI(TAG, "BAP prof %03u: %s", o, line);
+    }
+
+    if (m_prof_len < VWEGOLF_PROF_MINLEN_LIST) {
+        // Kurze Variante: einzelnes Profil, andere Byteanordnung. Nur melden.
+        ESP_LOGI(TAG, "BAP short profile (%u bytes), offsets not applicable", m_prof_len);
+        return;
+    }
+    if (m_prof_gap) {
+        ESP_LOGW(TAG, "BAP profile has gaps -- values unreliable, do NOT use for write");
+    }
+    m_prof_valid = !m_prof_gap;
+    uint8_t raw_current = m_prof_buf[VWEGOLF_PROF_OFS_CURRENT];
+    uint8_t raw_soc = m_prof_buf[VWEGOLF_PROF_OFS_SOCLIMIT];
+    uint8_t raw_temp = m_prof_buf[VWEGOLF_PROF_OFS_TEMP];
+    float temp = (float)raw_temp / 10.0F + 10.0F;
+
+    if (m_cc_temp) m_cc_temp->SetValue(temp);
+    StandardMetrics.ms_v_charge_climit->SetValue(raw_current);
+    StandardMetrics.ms_v_charge_limit_soc->SetValue(raw_soc);
+
+    ESP_LOGI(TAG, "BAP profile: %u bytes, charge current %uA, SoC limit %u%%, climate target %.1f C",
+             m_prof_len, raw_current, raw_soc, temp);
+}
+
+// Netzwerkmanagement des Komfort-CAN. Zwei Frames, wie sie das Werks-OCU
+// sendet: die NM-Anmeldung mit voller Partial-Network-Anforderung und die
+// zugehoerige Zustandsmeldung. Am Fahrzeug verifiziert -- damit wacht das
+// Fahrzeug vollstaendig auf (alle acht Knoten inkl. 0x14, BAP-Kanal 0x25 offen)
+// und die Klimatisierung laesst sich aus dem Tiefschlaf starten.
+bool OvmsVehicleVWeGolf::SendNetworkManagement() {
+    canbus* comfBus = m_can3;
+    uint8_t data[8];
+
+    // Der Komfort-CAN-Transceiver wird im Schlaf stromlos geschaltet. Ohne ihn
+    // erreicht kein Weckframe die Leitung: Die Konsole meldet "Can bus is not
+    // powered on", und saemtliche Zaehler bleiben auf null -- kein Interrupt,
+    // kein Sendeversuch, nicht einmal ein Fehler. Also zuerst einschalten.
+    if (comfBus->GetPowerMode() != On) {
+        ESP_LOGI(TAG, "Powering up comfort CAN transceiver for wakeup");
+        comfBus->SetPowerMode(On);
+        // SetPowerMode(On) startet den Bus nur, wenn er zuvor nicht ganz
+        // abgeschaltet war (mcp2515: "if (m_mode != CAN_MODE_OFF) Start(...)").
+        // Nach einem echten Power-Off steht m_mode auf OFF -- dann muss der Bus
+        // ausdruecklich gestartet werden, sonst quittiert der Treiber jeden
+        // Sendeversuch mit "Cannot write can3 when not in ACTIVE mode".
+        comfBus->Start(CAN_MODE_ACTIVE, CAN_SPEED_500KBPS);
+        vTaskDelay(pdMS_TO_TICKS(250));  // Anlaufzeit des MCP2515
+    }
+
+    // 0x1B000067: NM-Anmeldung Knoten 0x67 (OCU).
+    // d[0] = Knotenadresse, d[2..7] = Partial-Network-Anforderung.
+    data[0] = 0x67;
+    data[1] = 0x00;
+    data[2] = 0x45;
+    data[3] = 0x8B;
+    data[4] = 0x54;
+    data[5] = 0x08;
+    data[6] = 0x08;
+    data[7] = 0x00;
+    // ESP_QUEUED ist normal: Der Hardwarepuffer ist belegt, der Frame geht
+    // gleich darauf raus. Nur ESP_FAIL heisst, dass die Warteschlange voll ist
+    // und der Frame verworfen wurde -- erst dann lohnt eine Pause.
+    bool ok = true;
+
+    // Waehrend des Weckens zweimal je Sekunde senden. Das VW-NM erwartet
+    // Meldungen etwa alle 500 ms; mit nur einer pro Sekunde wacht der Bus zwar
+    // kurz auf, faellt aber zurueck in den Schlaf, bevor die BAP-Schicht oben
+    // ist. Sobald das Fahrzeug antwortet, genuegt eine Meldung pro Durchlauf.
+    // Zwei Schuesse je Sekunde, also ~500 ms Abstand -- so taktet auch das
+    // Werks-OCU im Mitschnitt. Mit 1000 ms (ein Schuss) blieb die Profilliste
+    // aus, mit ~450 ms ueber die Konsole kam sie. Der wache Fall war bisher
+    // ausgenommen; das war vermutlich zu duenn.
+    int bursts = 2;
+    for (int burst = 0; burst < bursts; burst++) {
+    if (comfBus->WriteExtended(VWEGOLF_NM_ID, 8, data) == ESP_FAIL) ok = false;
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // 0x17F00067: Zustandsmeldung desselben Knotens. Byte 7 = 0x80 im
+    // eingeschwungenen Netz (0x00 nur waehrend des Hochlaufs).
+    data[0] = 0x20;
+    data[1] = 0x67;
+    data[2] = 0x00;
+    data[3] = 0x00;
+    data[4] = 0x00;
+    data[5] = 0x00;
+    data[6] = 0x00;
+    data[7] = 0x80;
+    if (comfBus->WriteExtended(VWEGOLF_NM_STATE_ID, 8, data) == ESP_FAIL) ok = false;
+    if (burst + 1 < bursts) vTaskDelay(pdMS_TO_TICKS(480));
+    }
+    return ok;
 }
 
 void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
@@ -979,7 +1227,34 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
 
     // Send a queued climate command now that the bus is awake and the heartbeat is
     // flowing (this only runs while online + control active).
-    if (m_climate_start_requested || m_climate_stop_requested) {
+    bool bus_settled = m_bap_ready && (m_clima_bap_seen || m_online_secs >= VWEGOLF_BUS_SETTLE_SECS);
+    if ((m_climate_start_requested || m_climate_stop_requested) && !bus_settled) {
+        ESP_LOGI(TAG, "Climate command queued, waiting for bus to settle (%us online, bap=%d, clima=%d)",
+                 m_online_secs, m_bap_ready, m_clima_bap_seen);
+    }
+    // Abfrage wiederholen, bis ein Profil da ist. Die ECU laesst sich Zeit --
+    // im belegten Fall kam die Antwort erst 7 s nach der Anfrage, unmittelbar
+    // nach dem Aufwachen gar nicht. 19 59 ist ein Get und veraendert nichts,
+    // Wiederholen ist daher gefahrlos.
+    if (m_profile_requested && bus_settled) {
+        if (m_prof_valid) {
+            m_profile_requested = false;
+            m_prof_retries = 0;
+        } else if (m_prof_wait > 0) {
+            m_prof_wait--;
+            m_control_hold = VWEGOLF_OCU_HOLD_SECS;
+        } else if (m_prof_retries > 0) {
+            m_prof_retries--;
+            m_prof_wait = 5;
+            ESP_LOGI(TAG, "BAP profile: attempt %u", 8 - m_prof_retries);
+            RequestBapProfile();
+            m_control_hold = VWEGOLF_OCU_HOLD_SECS;
+        } else {
+            ESP_LOGW(TAG, "BAP profile: no answer after 8 attempts, giving up");
+            m_profile_requested = false;
+        }
+    }
+    if ((m_climate_start_requested || m_climate_stop_requested) && bus_settled) {
         bool enable = m_climate_start_requested;
         m_climate_start_requested = false;
         m_climate_stop_requested = false;
