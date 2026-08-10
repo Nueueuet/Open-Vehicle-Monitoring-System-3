@@ -66,7 +66,7 @@ GSM Antenna                 1000500 Open Vehicles OVMS GSM Antenna (or compatibl
 GPS Antenna                 1020200 Universal GPS Antenna (or compatible)
 SOC Display                 Yes
 Range Display               Yes
-Cabin Pre-heat/cool Control Yes
+Cabin Pre-heat/cool Control Yes (respects the e-Manager "climate when unplugged" setting — see below)
 GPS Location                Yes (decoded from KCAN frame 0x486)
 Speed Display               Yes
 Temperature Display         Yes (see list of metrics below)
@@ -79,3 +79,27 @@ Lock/Unlock Vehicle         No
 Valet Mode Control          No
 Others
 =========================== ==============
+
+---------------------
+Cabin Climate Control
+---------------------
+
+Remote cabin pre-heat/cool is triggered by starting the car's own **global
+(immediate) pre-conditioning profile** — the module does not send its own
+temperature or power-source options, it just tells the car to run that profile.
+As a result the behaviour is governed by the settings you have stored in the
+car's climate/charging menu (the "e-Manager" preconditioning settings), not by
+OVMS:
+
+* **Target temperature** comes from the car's stored pre-conditioning setpoint,
+  not from OVMS.
+* **"Climatise only while plugged in" (yes/no)** is respected. If your e-Manager
+  is set to pre-condition only when the charging cable is connected, a remote
+  climate request sent while the car is **unplugged will not run** cabin
+  conditioning (the car declines it). Set that option to allow climatisation
+  without external supply if you want remote pre-conditioning to work on battery
+  while parked and unplugged.
+
+In other words, OVMS starts and stops the same pre-conditioning the car would
+run for a departure timer; configure *what* it does in the car, and use OVMS to
+trigger it on demand.

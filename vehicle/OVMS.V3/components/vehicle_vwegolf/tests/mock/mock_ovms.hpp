@@ -39,6 +39,8 @@ typedef union {
 
 typedef int esp_err_t;
 static constexpr esp_err_t ESP_OK = 0;
+static constexpr esp_err_t ESP_QUEUED = 1;  // frame queued for later TX (matches can.h)
+static constexpr esp_err_t ESP_FAIL = -1;
 
 struct canbus {
     uint8_t m_busnumber = 0;
@@ -190,6 +192,12 @@ struct OvmsConfig {
     void SetParamValue(const char*, const char*, const char*) {}
 };
 extern OvmsConfig MyConfig;
+
+// Minimal user-notification stub (real OVMS: MyNotify.NotifyString).
+struct OvmsNotify {
+    void NotifyString(const char* /*type*/, const char* /*subtype*/, const char* /*value*/) {}
+};
+extern OvmsNotify MyNotify;
 
 // ---------------------------------------------------------------------------
 // Commands

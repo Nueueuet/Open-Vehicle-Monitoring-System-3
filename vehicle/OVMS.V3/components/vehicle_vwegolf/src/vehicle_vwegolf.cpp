@@ -29,6 +29,9 @@
 // #include <stdio.h>
 #include "vehicle_vwegolf.h"
 
+#include "ovms_notify.h"            // MyNotify — user notifications for climate outcome
+#include "egolf/battery_control.h"  // BatteryControl (LSG 0x25): climate command + status decode
+
 #undef TAG
 #define TAG "v-vwegolf"
 
@@ -60,6 +63,7 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
         m_control_hold = 0;
         m_climate_start_requested = false;
         m_climate_stop_requested = false;
+        m_climate_wake_hold = 0;  // also drop any in-flight climate NM-wake bridge
         ESP_LOGI(TAG, "OCU keepalive stopped");
     });
     cmd_vweg->RegisterCommand("fold_mirrors", "Fold mirrors in",
@@ -175,6 +179,42 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
     // //TODO Debug only doesn't work ECU timeout
     // vTaskDelay(pdMS_TO_TICKS(500)); //500ms wait.. hopefully my log isn't get messed up
     // //TODO end doesn't work ECU timeout
+
+    // BAP BatteryControl (LSG 0x25) FSG status on 0x17332510: reassemble the segmented
+    // telegrams and read the authoritative climate on/off from the OperationMode status
+    // reply (element "49 58 <flag>"). Only feed genuine KCAN frames — IncomingFrameCan2
+    // forwards its frames here too, and feeding the bridged duplicates would corrupt the
+    // single reassembly stream.
+    if (p_frame->MsgID == bap::egolf::kCanIdStatus && p_frame->origin == m_can3) {
+        // Any status frame here means the BCU's BAP layer is up and listening — this is the
+        // readiness gate for the first climate send (Ticker1). The BCU broadcasts its status
+        // unsolicited on wake, and boots ~1.5 s after the rest of the comfort domain, so this
+        // is a far tighter/safer trigger than "any KCAN traffic".
+        m_bcu_seen = true;
+        bap::Element el;
+        if (m_bap_asm.feed(p_frame->MsgID, d, p_frame->FIR.B.DLC, el) &&
+            el.lsg == bap::egolf::kLsg) {
+            if (el.opcode == bap::OP_ERROR) {
+                // BCU rejected/failed a BatteryControl request (e.g. not plugged in, not
+                // ready, invalid). Surface it — otherwise the Ticker1 loop would just
+                // retry blindly. The retry window still bounds our attempts.
+                m_climate_error = true;
+                ESP_LOGW(TAG,
+                         "BatteryControl BAP ERROR response (func 0x%02X) — request rejected/failed",
+                         el.func);
+            } else if (el.opcode == bap::OP_STATUS &&
+                       el.func == bap::egolf::FUNC_OPERATION_MODE && el.bodyLen >= 1) {
+                // OperationMode status echo "49 58 <flag>": authoritative climate on/off,
+                // and the confirmation that our command landed.
+                bool hvac_on = el.body[0] != 0;
+                StandardMetrics.ms_v_env_hvac->SetValue(hvac_on);
+                m_climate_confirmed = (hvac_on == m_climate_enable);
+                m_climate_error = false;  // a good status supersedes an earlier transient error
+                ESP_LOGI(TAG, "BatteryControl OperationMode status 49 58 %02x -> HVAC %s",
+                         el.body[0], hvac_on ? "ON" : "OFF");
+            }
+        }
+    }
 
     switch (p_frame->MsgID) {
         // TODO: Need to move to verify
@@ -784,6 +824,46 @@ void OvmsVehicleVWeGolf::Ticker1(uint32_t ticker) {
             ESP_LOGI(TAG, "OCU hold window expired — releasing heartbeat (control inactive)");
         }
     }
+
+    // Climate NM-wake bridge (independent of the OCU heartbeat above). Wakeup is NOT
+    // instant: the transceivers come up in ms but the BCU needs ~1-2 s+ (more from deep
+    // sleep) to bring its BAP layer up. So each second we (a) keep sending the spare-node
+    // NmWake to wake and hold the cluster, and (b) once the BCU is heard (m_bcu_seen),
+    // RE-SEND the BAP channel handshake + command every tick until the BCU echoes it
+    // (m_climate_confirmed). Gating on the BCU's own status frame is the readiness probe —
+    // no need to guess when it's ready. On confirmation we release; the BCU + cluster then
+    // sustain their own NM for the session (no keepalive needed).
+    if (m_climate_wake_hold > 0) {
+        SendNmWake();  // ~1 Hz, within the AUTOSAR NM timeout, to wake and hold the cluster
+        // Fire the BAP command as soon as the BCU is heard (m_bcu_seen), then re-send every
+        // tick (1 Hz) until it echoes. Waiting for the BCU's own status rather than a fixed
+        // cadence removes the ~1.3 s we otherwise waste sending before it has booted.
+        if (!m_climate_confirmed && m_bcu_seen) {
+            SendClimateControl(m_climate_enable);  // handshake + trigger; retried until confirmed
+            m_climate_cmd_sent = true;
+        }
+        m_climate_wake_hold--;
+        if (m_climate_confirmed && m_climate_wake_hold > 2)
+            m_climate_wake_hold = 2;  // BCU confirmed (49 58 echo) — release soon, small grace
+        if (m_climate_wake_hold == 0) {
+            // Terminal outcome (fires once): release the NM. Success is confirmed by the
+            // BCU echo and reflected in ms_v_env_hvac, so it needs no separate notification;
+            // on failure we notify with the distinguished cause so a remote user knows what
+            // happened rather than silently thinking it worked.
+            if (m_climate_confirmed) {
+                ESP_LOGI(TAG, "Climate %s confirmed — releasing NM, cluster self-sustains",
+                         m_climate_enable ? "ON" : "OFF");
+            } else {
+                const char* reason =
+                    m_climate_error   ? "Climate command rejected by the battery control unit"
+                    : m_climate_tx_fail ? "Climate command failed: CAN transmit error (try 'can can3 reset')"
+                                        : "Climate command: no response from ECU (timeout)";
+                ESP_LOGE(TAG, "Climate %s FAILED — releasing NM: %s",
+                         m_climate_enable ? "ON" : "OFF", reason);
+                MyNotify.NotifyString("alert", "xvg.climate", reason);
+            }
+        }
+    }
 }
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandLock(const char* pin) {
@@ -826,32 +906,21 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandPanic() {
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandClimateControl(bool enable) {
     ESP_LOGI(TAG, "CommandClimateControl %s", enable ? "ON" : "OFF");
-    // Queue the request; the BAP frames are actually sent from SendOcuHeartbeat,
-    // which only runs once the comfort bus is awake and the OCU heartbeat is
-    // flowing (m_is_control_active && m_is_car_online). Latest request wins.
-    m_climate_start_requested = enable;
-    m_climate_stop_requested = !enable;
-    // Climate needs the car awake — this deliberately uses the OCU wake/heartbeat
-    // path. If the bus is asleep, wake it; the queued command goes out on the next
-    // heartbeat tick after the car comes online.
-    if (!m_is_car_online)
-        CommandWakeup();
-    m_is_control_active = true;
-    m_control_hold = VWEGOLF_OCU_HOLD_SECS;  // held (re-armed by Ticker1) until the command is delivered
+    // Non-colliding path (independent of the OCU 0x5A7 heartbeat): assert a spare-node
+    // NM wake to bring up the comfort/EV cluster, then send the BAP climate command.
+    // The wake is held only as a short bridge in Ticker1 — once the BCU accepts the
+    // command it and the cluster sustain their own NM, so we release. No OCU
+    // impersonation (which set OCU DTCs U0011/U1201).
+    m_climate_enable = enable;
+    m_climate_cmd_sent = false;
+    m_climate_confirmed = false;
+    m_climate_error = false;
+    m_climate_tx_fail = false;
+    m_bcu_seen = false;  // re-arm the readiness gate; the BCU re-announces within ~1 s on a
+                         // warm bus (status ~1.9 Hz) and ~1.5 s from cold
+    m_climate_wake_hold = VWEGOLF_CLIMATE_WAKE_SECS;
+    SendNmWake();  // kick the wake now; Ticker1 sustains it and sends the BAP command
     return Success;
-}
-
-void OvmsVehicleVWeGolf::Ticker10(uint32_t ticker) {
-    // working
-    m_climate_control_temp = MyConfig.GetParamValueInt("xvg", "cc_temp", 21);
-    m_climate_control_on_battery = (MyConfig.GetParamValueBool("xvg", "cc_onbat", false) ? 1 : 0);
-
-    ESP_LOGV(TAG,
-             "Trigger10 cc_temp: %u °C, cc_onbat: %u, control_mirror %u, control_horn: %u, "
-             "control_indicator: %u, control_panicMode: %u, control_unlock %u, control_lock %u",
-             m_climate_control_temp, m_climate_control_on_battery, m_mirror_fold_in_requested,
-             m_horn_requested, m_indicators_requested, m_panic_mode_requested, m_unlock_requested,
-             m_lock_requested);
 }
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandWakeup() {
@@ -995,59 +1064,66 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
 }
 
 void OvmsVehicleVWeGolf::SendClimateControl(bool enable) {
-    // Start/stop climate on CAN 0x17332501 (LSG 0x25 BatteryControl), reproducing the
-    // sequence a real controller sends: BAP channel handshake (19 42 / 19 41), then a
-    // profile-arm write on func 0x959, then the actual immediate-start trigger on func
-    // 0x958. The trigger is the frame that starts conditioning — arming alone does
-    // nothing. Called only after the controller has been reset to error-active
-    // (retries on), so frames deliver reliably on the busy comfort bus.
-    //
-    // BAP wire func = 0x940 + propId: func 0x959 = SetBatteryControlProfileList
-    // (propId 0x19, "arm"); func 0x958 = SetBatteryControlImmediately (propId 0x18,
-    // body {profileId, controlFlag}). Header nibble 2 = SET (a status reply from the
-    // BCU would be nibble 4, e.g. 49 58). Selector 0x22 = start, 0x23 = stop.
+    // Emit the BatteryControl climate command on 0x17332501 (LSG 0x25) via the BAP
+    // transport (vendored bap-lib): the channel-open handshake, then the OperationMode
+    // immediate trigger ("29 58 00 <flag>"). The trigger runs the global profile
+    // (profileId 0), which already holds the configured target temp. The old
+    // ProfilesArray "arm" write only set charge maxCurrent (irrelevant to climate) and
+    // is documented as a no-op for starting conditioning, so it is omitted. The BCU
+    // echoes "49 58 <flag>" on 0x17332510, decoded in IncomingFrameCan3 to confirm.
     canbus* comfBus = m_can3;
-    uint8_t data[8];
+    auto sink = [comfBus](const uint8_t* frame, uint8_t dlc) -> bool {
+        // ESP_OK = frame in a HW TX buffer; ESP_QUEUED = accepted into the driver's SW
+        // TX queue (HW buffers busy — routine while the controller is error-passive right
+        // after the NM wake, or when the bus is congested). Both mean the frame WILL be
+        // transmitted in order, so both are success; only ESP_FAIL (SW queue overflow /
+        // controller off / bus-off) is a real failure. Treating ESP_QUEUED as failure made
+        // the atomic-handshake guard below abort before sending the trigger on a busy bus,
+        // even though every frame was transmitting fine.
+        esp_err_t r = comfBus->WriteExtended(bap::egolf::kCanIdCommand, dlc,
+                                             const_cast<uint8_t*>(frame));
+        vTaskDelay(pdMS_TO_TICKS(10));  // pace frames on the busy comfort bus
+        return r == ESP_OK || r == ESP_QUEUED;
+    };
+    // BAP channel-open handshake: GET BapConfig (func 0x02, "19 42") + GetAll (func
+    // 0x01, "19 41") open/sync the logical channel with the BCU (a cold BCU ignores the
+    // trigger until the channel is up; a warm BCU skips it). Retried by Ticker1.
+    bap::SendResult g1 = bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, 0x02, nullptr, 0);
+    bap::SendResult g2 = bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, 0x01, nullptr, 0);
+    // Atomic handshake: only fire the trigger if BOTH GETs were accepted by the controller
+    // (queued counts — see sink). A genuinely rejected GET (ESP_FAIL: SW queue overflow /
+    // controller off / bus-off) leaves the BCU's logical channel half-open, so it would
+    // discard the trigger — bail and let Ticker1 re-send the whole handshake next tick.
+    if (!g1.ok() || !g2.ok()) {
+        m_climate_tx_fail = true;
+        ESP_LOGW(TAG, "Climate handshake GET TX rejected (g1=%d g2=%d) — retrying whole handshake",
+                 g1.ok(), g2.ok());
+        return;
+    }
+    // Trigger: OperationMode immediate start/stop of the global profile (no arm).
+    bap::SendResult r = bap::egolf::sendClimate(sink, enable);
+    // Track CAN-layer failure: the sink returns false only on ESP_FAIL (SW queue overflow /
+    // controller off / bus-off), which surfaces here as a non-Ok status. Distinguishes
+    // "the bus/controller is broken" from "the ECU didn't reply".
+    m_climate_tx_fail = !r.ok();
+    if (m_climate_tx_fail)
+        ESP_LOGW(TAG, "Climate BAP trigger CAN write FAILED (status %d, %u/%u frames) — bus/controller?",
+                 (int)r.status, r.framesSent, bap::expectedFrames(2));
+    else
+        ESP_LOGI(TAG, "Climate %s BAP trigger sent to 0x%08x (%u frames)",
+                 enable ? "START" : "STOP", (unsigned)bap::egolf::kCanIdCommand, r.framesSent);
+}
 
-    // BAP channel open handshake.
-    data[0] = 0x19; data[1] = 0x42;
-    comfBus->WriteExtended(0x17332501, 2, data);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    data[0] = 0x19; data[1] = 0x41;
-    comfBus->WriteExtended(0x17332501, 2, data);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Profile-arm, frame 1 (BAP long-message start): 80 08 29 59 <sel> 06 00 01
-    data[0] = 0x80;                  // BAP long-message start; payload length in d[1]
-    data[1] = 0x08;                  // payload length = 8
-    data[2] = 0x29;                  // SET (nibble 2) | func hi
-    data[3] = 0x59;                  // func 0x959 = SetBatteryControlProfileList (arm)
-    data[4] = enable ? 0x22 : 0x23;  // selector: start / stop
-    data[5] = 0x06;
-    data[6] = 0x00;
-    data[7] = 0x01;
-    comfBus->WriteExtended(0x17332501, 8, data);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Profile-arm, frame 2 (continuation / final): C0 06 00 20 00
-    data[0] = 0xC0;
-    data[1] = 0x06;
-    data[2] = 0x00;
-    data[3] = 0x20;
-    data[4] = 0x00;
-    comfBus->WriteExtended(0x17332501, 5, data);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Trigger: SetBatteryControlImmediately (func 0x958, propId 0x18), body =
-    // {profileId, controlFlag}. profileId 0 = global/"Optionen" profile (holds the
-    // configured target temp); controlFlag 1 = start now, 0 = stop. This is the frame
-    // that actually starts/stops conditioning.
-    data[0] = 0x29;                  // SET (nibble 2) | func hi
-    data[1] = 0x58;                  // func 0x958 = SetBatteryControlImmediately
-    data[2] = 0x00;                  // profileId 0 = global profile
-    data[3] = enable ? 0x01 : 0x00;  // controlFlag: start / stop
-    comfBus->WriteExtended(0x17332501, 4, data);
-
-    ESP_LOGI(TAG, "Climate %s command sent (0x17332501: arm sel=0x%02x + trigger 29 58 00 %02x)",
-             enable ? "START" : "STOP", enable ? 0x22 : 0x23, enable ? 0x01 : 0x00);
+void OvmsVehicleVWeGolf::SendNmWake() {
+    // AUTOSAR CAN-NM wake from a SPARE (unused) node id (id = 0x1B000000 + node), so we
+    // never impersonate the real OCU (node 0x67) — that duplicate-node clash set OCU
+    // DTCs U0011/U1201. The payload requests the comfort/EV partial-network cluster:
+    //   byte0 = source node id (spare)          byte1 = 0x10 CBV active-wakeup
+    //   byte2 = 0x49 = 0x40 charge | 0x08 climate PNC | 0x01 comfort baseline
+    //   byte3 = 0x85 = 0x84 (observed wake request) | 0x01 (Climatronic 0x46 PNC)
+    //   byte4 = 0x14 (observed wake request bits)
+    // The Climatronic (0x46) PNC bits (byte2 0x08, byte3 0x01) are firmware- and
+    // wire-confirmed; the 0x40/0x84/0x14 bits replay the observed remote-service wake.
+    uint8_t data[8] = {VWEGOLF_NM_WAKE_NODE, 0x10, 0x49, 0x85, 0x14, 0x00, 0x00, 0x00};
+    m_can3->WriteExtended(0x1B000000u | VWEGOLF_NM_WAKE_NODE, 8, data);
 }
