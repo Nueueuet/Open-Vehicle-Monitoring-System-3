@@ -52,8 +52,12 @@
 // faehrt die BAP-Anwendungsschicht inklusive Klima-Kanal 0x25 hoch. Mit der
 // zuvor verwendeten Maske wachte zwar der Bus auf, aber weder Knoten 0x14 noch
 // irgendein BAP-Kanal -- der Klimabefehl lief ins Leere.
-#define VWEGOLF_NM_ID 0x1B000067UL
-#define VWEGOLF_NM_STATE_ID 0x17F00067UL
+// Eigene NM-Knotenkennung. NICHT 0x67 verwenden -- das ist das eingebaute OCU.
+// 0x7D wurde in 73264 NM-Frames aus 41 Mitschnitten (@slothish) und in unseren
+// eigenen beiden Mitschnitten nie beobachtet.
+#define VWEGOLF_NM_NODE 0x7D
+#define VWEGOLF_NM_ID (0x1B000000UL | VWEGOLF_NM_NODE)
+#define VWEGOLF_NM_STATE_ID (0x17F00000UL | VWEGOLF_NM_NODE)
 
 // Nach dem Wecken aus dem Tiefschlaf dauert es rund 30 s, bis der Klima-Kanal
 // offen ist (das Werks-OCU sendet seine erste Transaktion bei +35 s). Solange

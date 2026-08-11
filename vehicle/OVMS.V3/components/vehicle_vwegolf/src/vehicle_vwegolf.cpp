@@ -1108,16 +1108,24 @@ bool OvmsVehicleVWeGolf::SendNetworkManagement() {
         vTaskDelay(pdMS_TO_TICKS(250));  // Anlaufzeit des MCP2515
     }
 
-    // 0x1B000067: NM-Anmeldung Knoten 0x67 (OCU).
-    // d[0] = Knotenadresse, d[2..7] = Partial-Network-Anforderung.
-    data[0] = 0x67;
+    // NM-Anmeldung unter EIGENER Knotenkennung. Aufbau wie bei allen Knoten
+    // im Mitschnitt: d[0] = Knotenadresse, d[1] = 0x00, d[2..7] = Anforderung
+    // der Teilnetze. Die Anforderung ist vom OCU uebernommen -- wir brauchen
+    // dieselben Teilnetze wach, und sie sagt nichts darueber aus, wer wir sind.
+    data[0] = VWEGOLF_NM_NODE;
     data[1] = 0x00;
-    data[2] = 0x45;
-    data[3] = 0x8B;
-    data[4] = 0x54;
-    data[5] = 0x08;
-    data[6] = 0x08;
+    data[2] = 0x01;
+    data[3] = 0x01;
+    data[4] = 0x04;
+    data[5] = 0x00;
+    data[6] = 0x00;
     data[7] = 0x00;
+
+    // Zustandsmeldung, eigener Puffer. Frueher teilte sie sich `data` mit der
+    // Anmeldung -- seit dem zweiten Schuss je Sekunde ging dadurch im zweiten
+    // Durchlauf die Anmeldung mit den Zustandsnutzdaten hinaus.
+    // Byte 7 = 0x80 im eingeschwungenen Netz (0x00 nur waehrend des Hochlaufs).
+    uint8_t state[8] = { 0x20, VWEGOLF_NM_NODE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 };
     // ESP_QUEUED ist normal: Der Hardwarepuffer ist belegt, der Frame geht
     // gleich darauf raus. Nur ESP_FAIL heisst, dass die Warteschlange voll ist
     // und der Frame verworfen wurde -- erst dann lohnt eine Pause.
@@ -1136,17 +1144,7 @@ bool OvmsVehicleVWeGolf::SendNetworkManagement() {
     if (comfBus->WriteExtended(VWEGOLF_NM_ID, 8, data) == ESP_FAIL) ok = false;
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // 0x17F00067: Zustandsmeldung desselben Knotens. Byte 7 = 0x80 im
-    // eingeschwungenen Netz (0x00 nur waehrend des Hochlaufs).
-    data[0] = 0x20;
-    data[1] = 0x67;
-    data[2] = 0x00;
-    data[3] = 0x00;
-    data[4] = 0x00;
-    data[5] = 0x00;
-    data[6] = 0x00;
-    data[7] = 0x80;
-    if (comfBus->WriteExtended(VWEGOLF_NM_STATE_ID, 8, data) == ESP_FAIL) ok = false;
+    if (comfBus->WriteExtended(VWEGOLF_NM_STATE_ID, 8, state) == ESP_FAIL) ok = false;
     if (burst + 1 < bursts) vTaskDelay(pdMS_TO_TICKS(480));
     }
     return ok;
