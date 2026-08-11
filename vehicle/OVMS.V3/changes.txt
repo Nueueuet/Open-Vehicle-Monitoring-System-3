@@ -8,6 +8,16 @@ Open Vehicle Monitor System v3 - Change log
     (discharge positive, charge negative).
 - VW e-Golf: report v.e.drivemode from the Charisma active profile (CAN 0x386), encoded
     1 = Normal, 2 = Eco, 3 = Eco+ to match the sibling VW e-Up module.
+- VW e-Golf: remote cabin climate pre-heat/cool via BAP. CommandClimateControl starts and
+    stops the car's own global (immediate) pre-conditioning profile on the comfort bus
+    (LSG 0x25); target temperature and power source follow the car's stored e-Manager
+    settings rather than OVMS. The "climatise only while plugged in" option is respected —
+    a request sent while unplugged will not run unless the car is set to precondition on
+    battery. v.e.hvac tracks the actual conditioning state (clima ECU frame 0x5EA).
+- VW e-Golf: new metric xvg.v.recup — regenerative-braking (recuperation) strength 0..4
+    (least..most) decoded from the drive-position nibble in 0x187; -1 (N/A) unless in D/B.
+- VW e-Golf: vendor a small BAP library (BAP transport + BatteryControl, LSG 0x25), used by
+    the climate command and for charge-timer / charging-profile status decode.
 - smart EQ:
     As soon as the 12V trickle charge begins, a timestamp is generated and stored in `m_12v_trickle_charge_times`.
     The counted value is set in `xsq.12v.trickle.count`.
