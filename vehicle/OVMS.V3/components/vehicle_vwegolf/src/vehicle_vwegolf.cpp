@@ -329,16 +329,17 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
         {
             // d[5] = active drive profile: 0x02 = Normal, 0x05 = Eco, 0x08 = Eco+
             // (matches the MIB CharismaProfiles enum auto_normal=2/efficiency=5/range=8).
-            // Mapped to ms_v_env_drivemode as 0 = Normal, 1 = Eco, 2 = Eco+.
+            // Mapped to ms_v_env_drivemode as 1 = Normal, 2 = Eco, 3 = Eco+, matching the
+            // sibling VW e-Up module's encoding (1 = STD, 2 = ECO, 3 = ECO+).
             switch (d[5]) {
                 case 0x02:
-                    StandardMetrics.ms_v_env_drivemode->SetValue(0);
-                    break;
-                case 0x05:
                     StandardMetrics.ms_v_env_drivemode->SetValue(1);
                     break;
-                case 0x08:
+                case 0x05:
                     StandardMetrics.ms_v_env_drivemode->SetValue(2);
+                    break;
+                case 0x08:
+                    StandardMetrics.ms_v_env_drivemode->SetValue(3);
                     break;
                 default:
                     // Unknown profile value — leave the last known drive mode.

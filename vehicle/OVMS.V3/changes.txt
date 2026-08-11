@@ -6,6 +6,8 @@ Open Vehicle Monitor System v3 - Change log
     park-time counter is used instead.
 - VW e-Golf: correct v.b.current / v.b.power sign to the OVMS output=positive convention
     (discharge positive, charge negative).
+- VW e-Golf: report v.e.drivemode from the Charisma active profile (CAN 0x386), encoded
+    1 = Normal, 2 = Eco, 3 = Eco+ to match the sibling VW e-Up module.
 - smart EQ:
     As soon as the 12V trickle charge begins, a timestamp is generated and stored in `m_12v_trickle_charge_times`.
     The counted value is set in `xsq.12v.trickle.count`.
