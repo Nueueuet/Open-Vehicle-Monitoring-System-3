@@ -80,6 +80,7 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     vehicle_command_t CommandUnlock(const char* pin) override;
     vehicle_command_t CommandWakeup() override;
     vehicle_command_t CommandClimateControl(bool enable) override;
+    bool SupportsClimateControl() override { return true; }
     void SendOcuHeartbeat();
     void SendClimateControl(bool enable);
     void SendNmWake();
