@@ -37,6 +37,7 @@
 
 // Vendored BAP protocol library (src/bap): comfort-bus BAP transport / reassembler.
 #include "bap/bap.h"
+#include "egolf/battery_control.h"
 
 // Car (poll) states
 #define VWEGOLF_OFF 0       // All systems sleeping
@@ -81,6 +82,20 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     vehicle_command_t CommandWakeup() override;
     vehicle_command_t CommandClimateControl(bool enable) override;
     bool SupportsClimateControl() override { return true; }
+    // Fordert die Profilliste an (Array-GET mit Bereichskopf).
+    void RequestProfiles();
+    // Wertet eine empfangene Profilliste aus.
+    void OnProfileArray(const uint8_t* body, uint16_t len);
+    // Schaltet "Klimatisieren ohne Ladekabel" im gespeicherten Profil 0.
+    // Schreibt nur, wenn eine Vorlage vorliegt und sich der Wert aendert.
+    void SetClimateOnBattery(bool allow, OvmsWriter* writer);
+    // Gibt die zwischengespeicherte Vorlage aus.
+    void ShowProfiles(OvmsWriter* writer);
+    // Sichert bzw. holt Profil 0 aus der Konfiguration. Ohne das waere die
+    // Vorlage nach jedem Neustart weg und der Schalter bis zum naechsten
+    // Fahrzeugbesuch blockiert -- das Fahrzeug beantwortet keine Abfrage.
+    void SaveProfile0();
+    void LoadProfile0();
     void SendOcuHeartbeat();
     void SendClimateControl(bool enable);
     void SendNmWake();
@@ -120,6 +135,19 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // The e-Golf's five regen levels as a 0..4 scale (least->most): D0 (coast) = 0,
     // D1 = 1, D2 = 2, D3 = 3, B = 4. -1 = N/A (not in gear D or B).
     OvmsMetricInt* m_recup_level = nullptr;
+    // Zieltemperatur der Vorklimatisierung aus Profil 0. Nicht zu verwechseln
+    // mit v.e.cabinsetpoint -- das kommt aus Frame 0x594 und traegt denselben
+    // Wert in anderer Kodierung.
+    OvmsMetricFloat* m_cc_temp = nullptr;
+
+    // Zwischenspeicher der Profilliste. Profil 0 ist das globale ("Optionen"),
+    // 1..3 sind die benannten Ortsprofile.
+    static const size_t kMaxProfiles = 4;
+    bap::egolf::Profile m_profiles[kMaxProfiles];
+    uint8_t m_profile_count = 0;
+    bool m_profiles_valid = false;
+    // Laufende Vorgangsnummer fuer Array-Zugriffe (der BCU spiegelt sie zurueck).
+    bap::egolf::TxnCounter m_bc_txn;
 };
 
 #endif  // #ifndef __VEHICLE_VWEG_H__

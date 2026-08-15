@@ -44,6 +44,9 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
     // Regenerative-braking strength (numeric, cheap to transmit). Decoded from the
     // gear-selector frame 0x187 in IncomingFrameCan2. -1 until first seen in D/B.
     m_recup_level = MyMetrics.InitInt("xvg.v.recup", SM_STALE_MIN, -1);
+    m_cc_temp = MyMetrics.InitFloat("xvg.v.cc.temp", SM_STALE_MIN, 0, Celcius);
+    MyConfig.RegisterParam("xvg", "VW e-Golf", true, true);
+    LoadProfile0();
 
     // KCAN (CAN3) carries comfort, body, and clima frames via the J533 gateway.
     // FCAN (CAN2) is the powertrain bus (BMS, motor controller, VIN).
@@ -66,6 +69,22 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
         m_climate_wake_hold = 0;  // also drop any in-flight climate NM-wake bridge
         ESP_LOGI(TAG, "OCU keepalive stopped");
     });
+    cmd_vweg->RegisterCommand(
+        "profile", "Show the charge/climate profile read from the car",
+        [this](int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc,
+               const char* const* argv) { ShowProfiles(writer); });
+    cmd_vweg->RegisterCommand(
+        "onbat", "Climatise without the charging cable (on|off)",
+        [this](int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc,
+               const char* const* argv) {
+            bool on = (argc > 0) && (strcmp(argv[0], "on") == 0);
+            if (argc < 1 || (strcmp(argv[0], "on") != 0 && strcmp(argv[0], "off") != 0)) {
+                writer->puts("Usage: xvg onbat on|off");
+                return;
+            }
+            SetClimateOnBattery(on, writer);
+        },
+        "<on|off>", 1, 1);
     cmd_vweg->RegisterCommand("fold_mirrors", "Fold mirrors in",
                               [this](...) { CommandMirrorFoldIn(); });
 }
@@ -202,6 +221,11 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
                 ESP_LOGW(TAG,
                          "BatteryControl BAP ERROR response (func 0x%02X) — request rejected/failed",
                          el.func);
+            } else if (el.opcode == bap::OP_STATUS &&
+                       el.func == bap::egolf::FUNC_PROFILES_ARRAY) {
+                // Profilliste -- kommt als Antwort auf einen Array-GET und
+                // ausserdem unaufgefordert, wenn im Fahrzeug etwas geaendert wird.
+                OnProfileArray(el.body, el.bodyLen);
             } else if (el.opcode == bap::OP_STATUS &&
                        el.func == bap::egolf::FUNC_OPERATION_MODE && el.bodyLen >= 1) {
                 // OperationMode status echo "49 58 <flag>": authoritative climate on/off,
@@ -1062,6 +1086,186 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
         SendClimateControl(enable);
         m_control_hold = VWEGOLF_OCU_HOLD_SECS;  // full grace after the command is sent
     }
+}
+
+// Sichert Profil 0 als Hexkette in der Konfiguration.
+void OvmsVehicleVWeGolf::SaveProfile0() {
+    uint8_t rec[bap::egolf::kProfileFixedLen + bap::egolf::kProfileMaxName + 1];
+    size_t n = bap::egolf::encodeProfile(rec, sizeof(rec), m_profiles[0]);
+    if (n == 0) return;
+    static const char* kHex = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(n * 2);
+    for (size_t i = 0; i < n; i++) {
+        hex += kHex[rec[i] >> 4];
+        hex += kHex[rec[i] & 0x0F];
+    }
+    if (MyConfig.GetParamValue("xvg", "profile0") != hex)
+        MyConfig.SetParamValue("xvg", "profile0", hex);
+}
+
+// Holt Profil 0 aus der Konfiguration zurueck.
+void OvmsVehicleVWeGolf::LoadProfile0() {
+    std::string hex = MyConfig.GetParamValue("xvg", "profile0");
+    if (hex.length() < 2 * bap::egolf::kProfileFixedLen || (hex.length() % 2) != 0) return;
+    size_t n = hex.length() / 2;
+    uint8_t rec[bap::egolf::kProfileFixedLen + bap::egolf::kProfileMaxName + 1];
+    if (n > sizeof(rec)) return;
+    for (size_t i = 0; i < n; i++) {
+        char buf[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+        rec[i] = (uint8_t)strtoul(buf, nullptr, 16);
+    }
+    if (!bap::egolf::decodeProfile(rec, (uint16_t)n, m_profiles[0])) return;
+    m_profile_count = 1;
+    m_profiles_valid = true;
+    if (m_cc_temp) m_cc_temp->SetValue(bap::egolf::rawToTemp(m_profiles[0].temperatureRaw));
+    ESP_LOGI(TAG, "Profile 0 restored from config: op=%02x, %uA, %.1fC",
+             m_profiles[0].operation, m_profiles[0].maxCurrent,
+             bap::egolf::rawToTemp(m_profiles[0].temperatureRaw));
+}
+
+// Gibt die zwischengespeicherte Profilvorlage aus.
+void OvmsVehicleVWeGolf::ShowProfiles(OvmsWriter* writer) {
+    if (!m_profiles_valid) {
+        writer->puts("No profile received yet.");
+        writer->puts("The car does not answer a GET on the profile array -- it only sends the");
+        writer->puts("list by itself. Change one setting in the car (e-Manager, general");
+        writer->puts("settings) and it will arrive within a second.");
+        return;
+    }
+    for (uint8_t i = 0; i < m_profile_count; i++) {
+        const bap::egolf::Profile& p = m_profiles[i];
+        writer->printf("Profile %u \"%s\"\n", i, p.name);
+        writer->printf("  charge current    %u A\n", p.maxCurrent);
+        writer->printf("  charge level      min %u%%  target %u%%\n",
+                       p.minChargeLevel, p.targetChargeLevel);
+        writer->printf("  climate target    %.1f C\n", bap::egolf::rawToTemp(p.temperatureRaw));
+        writer->printf("  charge here       %s\n",
+                       (p.operation & bap::egolf::PO_CHARGING) ? "yes" : "no");
+        writer->printf("  climatise         %s\n",
+                       (p.operation & bap::egolf::PO_CLIMATE) ? "yes" : "no");
+        writer->printf("  without cable     %s\n",
+                       (p.operation & bap::egolf::PO_ALLOW_BATTERY) ? "yes" : "no");
+    }
+}
+
+// Schaltet das Kennzeichen "ohne externe Versorgung klimatisieren" in Profil 0.
+void OvmsVehicleVWeGolf::SetClimateOnBattery(bool allow, OvmsWriter* writer) {
+    if (!m_profiles_valid) {
+        writer->puts("Refusing to write: no profile has been read from the car yet.");
+        writer->puts("Writing without a template would overwrite the target temperature,");
+        writer->puts("charge current and profile name with zeroes. Change one setting in the");
+        writer->puts("car once -- the car then sends its profile and this command will work.");
+        return;
+    }
+
+    bap::egolf::Profile p = m_profiles[0];
+    bool current = (p.operation & bap::egolf::PO_ALLOW_BATTERY) != 0;
+    if (current == allow) {
+        writer->printf("Already %s -- nothing to write.\n", allow ? "on" : "off");
+        return;
+    }
+    if (allow) p.operation |= bap::egolf::PO_ALLOW_BATTERY;
+    else       p.operation &= (uint8_t)~bap::egolf::PO_ALLOW_BATTERY;
+
+    canbus* comfBus = m_can3;
+    auto sink = [comfBus](const uint8_t* frame, uint8_t dlc) -> bool {
+        esp_err_t r = comfBus->WriteExtended(bap::egolf::kCanIdCommand, dlc,
+                                             const_cast<uint8_t*>(frame));
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return r == ESP_OK || r == ESP_QUEUED;
+    };
+    // Kanal oeffnen wie beim Klimabefehl -- ein kaltes Steuergeraet verwirft sonst alles.
+    bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, 0x02, nullptr, 0);
+    bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, 0x01, nullptr, 0);
+
+    bap::SendResult r = bap::egolf::sendProfileWrite(
+        sink, m_bc_txn, bap::egolf::kAsgIdOcu,
+        0,   // RecordAddr 0 = vollstaendiger Satz
+        0,   // Position 0 = das globale Profil
+        p);
+    if (!r.ok()) {
+        writer->puts("Write rejected by the CAN driver -- is the car awake?");
+        ESP_LOGW(TAG, "Profile write failed (op=%02x -> %02x)", m_profiles[0].operation, p.operation);
+        return;
+    }
+    ESP_LOGI(TAG, "Profile write sent: operation %02x -> %02x (%u frames)",
+             m_profiles[0].operation, p.operation, r.framesSent);
+    writer->printf("Sent: climatise without cable %s (%u frames).\n",
+                   allow ? "ON" : "OFF", r.framesSent);
+    writer->puts("The car echoes its updated profile -- check with 'xvg profile'.");
+}
+
+// Fordert die Profilliste an. Anders als ein blankes "19 59" traegt die Anfrage
+// den Array-Bereichskopf, ohne den das Steuergeraet nicht weiss, welchen
+// Ausschnitt es liefern soll.
+void OvmsVehicleVWeGolf::RequestProfiles() {
+    canbus* comfBus = m_can3;
+    auto sink = [comfBus](const uint8_t* frame, uint8_t dlc) -> bool {
+        esp_err_t r = comfBus->WriteExtended(bap::egolf::kCanIdCommand, dlc,
+                                             const_cast<uint8_t*>(frame));
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return r == ESP_OK || r == ESP_QUEUED;
+    };
+    // Kanal oeffnen wie beim Klimabefehl -- ein kalter BCU ignoriert sonst alles.
+    bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, 0x02, nullptr, 0);
+    bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, 0x01, nullptr, 0);
+
+    // Drei Kopfvarianten nacheinander, alle rein lesend. Byte 1 ist nicht nur die
+    // RecordAddr, sondern traegt laut Doku Flags:
+    //     [LargeIdx:1][PosTransmit:1][Backward:1][Shift:1][RecordAddr:4]
+    // Ohne PosTransmit fehlt der Antwort womoeglich die Positionsangabe, und das
+    // Steuergeraet verweigert sie ganz. Variante A war bereits still.
+    struct { uint8_t flags; uint8_t start; uint8_t count; const char* what; } tries[] = {
+        { 0x00, 0, (uint8_t)kMaxProfiles, "RA0, alle" },
+        { 0x40, 0, (uint8_t)kMaxProfiles, "RA0 + PosTransmit, alle" },
+        { 0x40, 0, 1,                     "RA0 + PosTransmit, nur Profil 0" },
+        { 0x00, 0, 1,                     "RA0, nur Profil 0" },
+    };
+    for (size_t i = 0; i < sizeof(tries)/sizeof(tries[0]); i++) {
+        uint8_t body[4];
+        size_t n = bap::egolf::buildArrayWriteBody(
+            body, sizeof(body),
+            bap::egolf::asgTxnByte(bap::egolf::kAsgIdOcu, m_bc_txn.next()),
+            tries[i].flags, tries[i].start, tries[i].count, nullptr, 0);
+        bap::SendResult r = bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg,
+                                             bap::egolf::FUNC_PROFILES_ARRAY, body, (uint16_t)n);
+        ESP_LOGI(TAG, "Profile GET %u (%s): %02x %02x %02x %02x, %u frames",
+                 (unsigned)(i + 1), tries[i].what,
+                 body[0], body[1], body[2], body[3], r.framesSent);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+
+// Wertet eine empfangene Profilliste aus.
+void OvmsVehicleVWeGolf::OnProfileArray(const uint8_t* body, uint16_t len) {
+    bap::egolf::ArrayResult res;
+    size_t n = bap::egolf::decodeProfileArray(body, len, m_profiles, kMaxProfiles, &res);
+    if (n == 0) {
+        ESP_LOGW(TAG, "Profile array: decode failed (%u bytes, declared %u%s%s)",
+                 len, res.declared, res.malformed ? ", malformed" : "",
+                 res.truncated ? ", truncated" : "");
+        return;
+    }
+    m_profile_count = (uint8_t)n;
+    m_profiles_valid = true;
+
+    for (size_t i = 0; i < n; i++) {
+        const bap::egolf::Profile& p = m_profiles[i];
+        ESP_LOGI(TAG,
+                 "Profile %u \"%s\": op=%02x op2=%02x maxCurrent=%uA "
+                 "minChargeLevel=%u%% targetChargeLevel=%u%% temp=%.1fC%s%s%s",
+                 (unsigned)i, p.name, p.operation, p.operation2, p.maxCurrent,
+                 p.minChargeLevel, p.targetChargeLevel,
+                 bap::egolf::rawToTemp(p.temperatureRaw),
+                 (p.operation & bap::egolf::PO_CHARGING) ? " [charge]" : "",
+                 (p.operation & bap::egolf::PO_CLIMATE) ? " [climate]" : "",
+                 (p.operation & bap::egolf::PO_ALLOW_BATTERY) ? " [on-battery]" : "");
+    }
+
+    // Profil 0 ist das globale; nur dort steht die Zieltemperatur.
+    if (m_cc_temp) m_cc_temp->SetValue(bap::egolf::rawToTemp(m_profiles[0].temperatureRaw));
+    SaveProfile0();
 }
 
 void OvmsVehicleVWeGolf::SendClimateControl(bool enable) {
