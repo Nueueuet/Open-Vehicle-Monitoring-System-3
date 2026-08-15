@@ -57,6 +57,10 @@
 // (Impersonating the real OCU node 0x67 caused OCU DTCs U0011/U1201.)
 #define VWEGOLF_NM_WAKE_NODE       0x7D  // spare node id (verified unused in captures)
 #define VWEGOLF_CLIMATE_WAKE_SECS  20    // max seconds to sustain the NM-wake bridge
+// Laenger als so viele Sekunden ohne Statusmeldung des BatteryControl-
+// Steuergeraets gilt der Komfort-CAN als schlafend, und ein Schreibvorgang
+// waere ein Schuss ins Leere.
+#define VWEGOLF_BCU_MAX_AGE        5
                                          // The BAP command is (re)sent from Ticker1 (1 Hz) as
                                          // soon as the BCU is heard (its 0x17332510 status) and
                                          // then every second until it echoes the command. The
@@ -95,6 +99,8 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     bool WriteProfile0(const bap::egolf::Profile& p, OvmsWriter* writer);
     // Gibt die zwischengespeicherte Vorlage aus.
     void ShowProfiles(OvmsWriter* writer);
+    // Einzeiliger, maschinenlesbarer Zustand fuer die App.
+    void ShowCcStatus(OvmsWriter* writer);
     // Sichert bzw. holt Profil 0 aus der Konfiguration. Ohne das waere die
     // Vorlage nach jedem Neustart weg und der Schalter bis zum naechsten
     // Fahrzeugbesuch blockiert -- das Fahrzeug beantwortet keine Abfrage.
@@ -152,6 +158,15 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     bool m_profiles_valid = false;
     // Laufende Vorgangsnummer fuer Array-Zugriffe (der BCU spiegelt sie zurueck).
     bap::egolf::TxnCounter m_bc_txn;
+    // Sekunden seit der letzten Statusmeldung des BatteryControl-Steuergeraets.
+    // 255 = seit dem Start nie gehoert. Anders als m_bcu_seen (Sperre pro
+    // Klimabefehl) beschreibt das den laufenden Zustand.
+    uint8_t m_bcu_age = 255;
+    // Erwartete Werte eines laufenden Schreibvorgangs; das Fahrzeug schickt die
+    // geaenderte Liste zurueck, daran erkennen wir den Erfolg.
+    bool m_prof_write_pending = false;
+    uint8_t m_prof_want_op = 0;
+    uint8_t m_prof_want_temp = 0;
 };
 
 #endif  // #ifndef __VEHICLE_VWEG_H__

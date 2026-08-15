@@ -93,6 +93,10 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
             SetClimateTemp((float)atof(argv[0]), writer);
         },
         "<degrees C, 15.5..30.0 in 0.5 steps>", 1, 1);
+    cmd_vweg->RegisterCommand(
+        "ccstatus", "Climate settings as one machine-readable line",
+        [this](int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc,
+               const char* const* argv) { ShowCcStatus(writer); });
     cmd_vweg->RegisterCommand("fold_mirrors", "Fold mirrors in",
                               [this](...) { CommandMirrorFoldIn(); });
 }
@@ -218,6 +222,7 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
         // unsolicited on wake, and boots ~1.5 s after the rest of the comfort domain, so this
         // is a far tighter/safer trigger than "any KCAN traffic".
         m_bcu_seen = true;
+        m_bcu_age = 0;
         bap::Element el;
         if (m_bap_asm.feed(p_frame->MsgID, d, p_frame->FIR.B.DLC, el) &&
             el.lsg == bap::egolf::kLsg) {
@@ -814,6 +819,7 @@ void OvmsVehicleVWeGolf::Ticker1(uint32_t ticker) {
     m_is_car_online = m_last_message_received < 10;
 
     if (m_last_message_received < 254) m_last_message_received++;
+    if (m_bcu_age < 255) m_bcu_age++;
     ESP_LOGV(TAG, "0x5A7 last_msg=%u", m_last_message_received);
 
     // awake (KL_15) and drivable (KL_15 && READY) are set from the terminal / READY
@@ -1132,6 +1138,20 @@ void OvmsVehicleVWeGolf::LoadProfile0() {
              bap::egolf::rawToTemp(m_profiles[0].temperatureRaw));
 }
 
+// Einzeiliger Zustand fuer die App. valid=0 heisst: noch keine Vorlage
+// empfangen, die App soll dann nichts anzeigen und nichts schreiben lassen.
+void OvmsVehicleVWeGolf::ShowCcStatus(OvmsWriter* writer) {
+    if (!m_profiles_valid) {
+        writer->puts("cctemp=0 onbat=0 current=0 valid=0");
+        return;
+    }
+    const bap::egolf::Profile& p = m_profiles[0];
+    writer->printf("cctemp=%.1f onbat=%d current=%u valid=1\n",
+                   bap::egolf::rawToTemp(p.temperatureRaw),
+                   (p.operation & bap::egolf::PO_ALLOW_BATTERY) ? 1 : 0,
+                   p.maxCurrent);
+}
+
 // Gibt die zwischengespeicherte Profilvorlage aus.
 void OvmsVehicleVWeGolf::ShowProfiles(OvmsWriter* writer) {
     if (!m_profiles_valid) {
@@ -1209,6 +1229,20 @@ void OvmsVehicleVWeGolf::SetClimateTemp(float degC, OvmsWriter* writer) {
 // Das Fahrzeug antwortet mit der aktualisierten Liste, die ueber den
 // Empfangspfad die Vorlage auffrischt.
 bool OvmsVehicleVWeGolf::WriteProfile0(const bap::egolf::Profile& p, OvmsWriter* writer) {
+    // Auf einem schlafenden Bus nimmt der Treiber den Frame zwar an, aber
+    // niemand empfaengt ihn. Lieber ehrlich ablehnen als Erfolg behaupten --
+    // und nebenbei die Sendewarteschlange nicht zulaufen lassen.
+    if (m_bcu_age > VWEGOLF_BCU_MAX_AGE) {
+        writer->puts("Car is asleep -- nothing was sent.");
+        writer->puts("Start pre-conditioning first; that wakes the car, then set the value.");
+        ESP_LOGI(TAG, "Profile write refused: BCU silent for %us", m_bcu_age);
+        return false;
+    }
+
+    m_prof_write_pending = true;
+    m_prof_want_op = p.operation;
+    m_prof_want_temp = p.temperatureRaw;
+
     canbus* comfBus = m_can3;
     auto sink = [comfBus](const uint8_t* frame, uint8_t dlc) -> bool {
         esp_err_t r = comfBus->WriteExtended(bap::egolf::kCanIdCommand, dlc,
@@ -1232,7 +1266,18 @@ bool OvmsVehicleVWeGolf::WriteProfile0(const bap::egolf::Profile& p, OvmsWriter*
     }
     ESP_LOGI(TAG, "Profile write sent: op=%02x temp=%02x current=%uA (%u frames)",
              p.operation, p.temperatureRaw, p.maxCurrent, r.framesSent);
-    writer->puts("The car echoes its updated profile -- check with 'xvg profile'.");
+
+    // Auf die zurueckgeschickte Liste warten. Beobachtet kam sie binnen einer
+    // Sekunde; drei sind reichlich und blockieren die Konsole nicht spuerbar.
+    for (int i = 0; i < 30 && m_prof_write_pending; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (m_prof_write_pending) {
+        m_prof_write_pending = false;
+        writer->puts("Sent, but the car did not confirm it -- the setting may be unchanged.");
+        ESP_LOGW(TAG, "Profile write not confirmed within 3s");
+        return false;
+    }
     return true;
 }
 
@@ -1289,6 +1334,15 @@ void OvmsVehicleVWeGolf::OnProfileArray(const uint8_t* body, uint16_t len) {
     }
     m_profile_count = (uint8_t)n;
     m_profiles_valid = true;
+
+    // Antwort auf einen eigenen Schreibvorgang? Dann traegt sie die Werte, die
+    // wir gesetzt haben.
+    if (m_prof_write_pending &&
+        m_profiles[0].operation == m_prof_want_op &&
+        m_profiles[0].temperatureRaw == m_prof_want_temp) {
+        m_prof_write_pending = false;
+        ESP_LOGI(TAG, "Profile write confirmed by the car");
+    }
 
     for (size_t i = 0; i < n; i++) {
         const bap::egolf::Profile& p = m_profiles[i];
