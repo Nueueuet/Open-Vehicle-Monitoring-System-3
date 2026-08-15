@@ -89,6 +89,10 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // Schaltet "Klimatisieren ohne Ladekabel" im gespeicherten Profil 0.
     // Schreibt nur, wenn eine Vorlage vorliegt und sich der Wert aendert.
     void SetClimateOnBattery(bool allow, OvmsWriter* writer);
+    // Setzt die Zieltemperatur der Vorklimatisierung (15,5 bis 30,0 GradC).
+    void SetClimateTemp(float degC, OvmsWriter* writer);
+    // Gemeinsamer Schreibweg beider Setzer.
+    bool WriteProfile0(const bap::egolf::Profile& p, OvmsWriter* writer);
     // Gibt die zwischengespeicherte Vorlage aus.
     void ShowProfiles(OvmsWriter* writer);
     // Sichert bzw. holt Profil 0 aus der Konfiguration. Ohne das waere die

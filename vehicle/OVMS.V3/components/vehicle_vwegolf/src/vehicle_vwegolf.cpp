@@ -85,6 +85,14 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
             SetClimateOnBattery(on, writer);
         },
         "<on|off>", 1, 1);
+    cmd_vweg->RegisterCommand(
+        "cctemp", "Set the pre-conditioning target temperature",
+        [this](int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc,
+               const char* const* argv) {
+            if (argc < 1) { writer->puts("Usage: xvg cctemp <15.5..30.0>"); return; }
+            SetClimateTemp((float)atof(argv[0]), writer);
+        },
+        "<degrees C, 15.5..30.0 in 0.5 steps>", 1, 1);
     cmd_vweg->RegisterCommand("fold_mirrors", "Fold mirrors in",
                               [this](...) { CommandMirrorFoldIn(); });
 }
@@ -1168,6 +1176,39 @@ void OvmsVehicleVWeGolf::SetClimateOnBattery(bool allow, OvmsWriter* writer) {
     if (allow) p.operation |= bap::egolf::PO_ALLOW_BATTERY;
     else       p.operation &= (uint8_t)~bap::egolf::PO_ALLOW_BATTERY;
 
+    if (WriteProfile0(p, writer))
+        writer->printf("Sent: climatise without cable %s.\n", allow ? "ON" : "OFF");
+}
+
+// Setzt die Zieltemperatur. Byte 12 des Satzes, roh = GradC * 10 - 100.
+void OvmsVehicleVWeGolf::SetClimateTemp(float degC, OvmsWriter* writer) {
+    if (!m_profiles_valid) {
+        writer->puts("Refusing to write: no profile has been read from the car yet.");
+        writer->puts("Change one setting in the car once -- it then sends its profile.");
+        return;
+    }
+    // Auf Halbgradschritte einrasten, wie das Fahrzeug sie fuehrt.
+    int deci = 5 * (int)lroundf(degC * 2.0F);
+    if (deci < 155 || deci > 300) {
+        writer->printf("Out of range: %.1f C. The car accepts 15.5 to 30.0 C.\n", degC);
+        return;
+    }
+    bap::egolf::Profile p = m_profiles[0];
+    uint8_t raw = bap::egolf::tempToRawDeci(deci);
+    if (raw == p.temperatureRaw) {
+        writer->printf("Already %.1f C -- nothing to write.\n", deci / 10.0F);
+        return;
+    }
+    p.temperatureRaw = raw;
+    if (WriteProfile0(p, writer))
+        writer->printf("Sent: target temperature %.1f C (was %.1f C).\n",
+                       deci / 10.0F, bap::egolf::rawToTemp(m_profiles[0].temperatureRaw));
+}
+
+// Gemeinsamer Schreibweg: Kanal oeffnen, vollstaendigen Satz an Position 0.
+// Das Fahrzeug antwortet mit der aktualisierten Liste, die ueber den
+// Empfangspfad die Vorlage auffrischt.
+bool OvmsVehicleVWeGolf::WriteProfile0(const bap::egolf::Profile& p, OvmsWriter* writer) {
     canbus* comfBus = m_can3;
     auto sink = [comfBus](const uint8_t* frame, uint8_t dlc) -> bool {
         esp_err_t r = comfBus->WriteExtended(bap::egolf::kCanIdCommand, dlc,
@@ -1186,14 +1227,13 @@ void OvmsVehicleVWeGolf::SetClimateOnBattery(bool allow, OvmsWriter* writer) {
         p);
     if (!r.ok()) {
         writer->puts("Write rejected by the CAN driver -- is the car awake?");
-        ESP_LOGW(TAG, "Profile write failed (op=%02x -> %02x)", m_profiles[0].operation, p.operation);
-        return;
+        ESP_LOGW(TAG, "Profile write failed");
+        return false;
     }
-    ESP_LOGI(TAG, "Profile write sent: operation %02x -> %02x (%u frames)",
-             m_profiles[0].operation, p.operation, r.framesSent);
-    writer->printf("Sent: climatise without cable %s (%u frames).\n",
-                   allow ? "ON" : "OFF", r.framesSent);
+    ESP_LOGI(TAG, "Profile write sent: op=%02x temp=%02x current=%uA (%u frames)",
+             p.operation, p.temperatureRaw, p.maxCurrent, r.framesSent);
     writer->puts("The car echoes its updated profile -- check with 'xvg profile'.");
+    return true;
 }
 
 // Fordert die Profilliste an. Anders als ein blankes "19 59" traegt die Anfrage
