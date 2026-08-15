@@ -1219,10 +1219,15 @@ void OvmsVehicleVWeGolf::SetClimateTemp(float degC, OvmsWriter* writer) {
         writer->printf("Already %.1f C -- nothing to write.\n", deci / 10.0F);
         return;
     }
+    // Den alten Wert VOR dem Schreiben sichern. Das Fahrzeug schickt die
+    // geaenderte Liste zurueck, und die aktualisiert die Vorlage noch waehrend
+    // WriteProfile0() auf genau diese Bestaetigung wartet -- danach gelesen
+    // waere "was" identisch mit dem neuen Wert.
+    float before = bap::egolf::rawToTemp(m_profiles[0].temperatureRaw);
     p.temperatureRaw = raw;
     if (WriteProfile0(p, writer))
         writer->printf("Sent: target temperature %.1f C (was %.1f C).\n",
-                       deci / 10.0F, bap::egolf::rawToTemp(m_profiles[0].temperatureRaw));
+                       deci / 10.0F, before);
 }
 
 // Gemeinsamer Schreibweg: Kanal oeffnen, vollstaendigen Satz an Position 0.
